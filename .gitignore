@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+graphify-out/
+.arena/
+*.db3
+rosbag*/
+maps/*.pgm

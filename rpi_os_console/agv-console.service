@@ -1,0 +1,25 @@
+# Raspberry Pi OS only. Install:
+#   sudo cp agv-console.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agv-console.service
+# Logs:  journalctl -u agv-console -f
+# Stop it before running any other GPIO script:  sudo systemctl stop agv-console
+[Unit]
+Description=AEGIS AGV Operator Console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sargunjit
+Group=sargunjit
+WorkingDirectory=/home/sargunjit/aegis_agv/rpi_os_console
+ExecStart=/usr/bin/python3 /home/sargunjit/aegis_agv/rpi_os_console/agv_console_angle.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

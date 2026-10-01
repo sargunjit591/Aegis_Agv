@@ -1,0 +1,309 @@
+================================================================================
+ PROJECT AEGIS — AGV PHASE 1 — PROGRESS LOG
+================================================================================
+ What this is:  a GPS-denied warehouse AGV. It must navigate among oil drums,
+                pick one up with its gripper, and carry it to a set location.
+                Phase 2 (later) ports the navigation stack to a drone
+                interceptor.
+
+ Vehicle:       front-steer tricycle. One steered front wheel (24 V wiper
+                motor), two rear wheels on a BLDC-driven axle, a linear-actuator
+                gripper, a pulsed brake. Wheelbase ~0.9 m. Raspberry Pi 5.
+
+ Read this top to bottom for the story. Section 13 is where we are right now.
+ Section 14 is what to do next.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ 1. MOTOR BRING-UP
+--------------------------------------------------------------------------------
+ Goal: make all three motors respond to the Pi.
+
+ - Steering and gripper run on BTS7960 H-bridges driven straight from GPIO.
+ - First attempt put PC817 optocouplers between Pi and BTS7960. Readings were
+   inconsistent and impossible to reason about, so the optos were REMOVED.
+   Direct GPIO wiring with BTS7960 VCC/EN on 3.3 V is the working design.
+ - The Pi crashed on the first gripper test. Causes: ground loops and a
+   misunderstanding of M+/M- (those go to the motor, not to the supply).
+   Fix: star grounding — logic ground and power ground meet at ONE point.
+ - The drive motor turned out to be a 3-phase BLDC with its own controller
+   (CY Gold 48 V / 60 A), not a simple brushed motor. Its throttle input is
+   driven from the Waveshare HAT's DAC.
+ - Drive would not respond until the HAT's analog ground was tied to the
+   controller's throttle ground (black wire). The red throttle wire is a 5 V
+   OUTPUT from the controller and is left unconnected.
+ - Measured throttle range: 0.8 V idle to 4.2 V full speed.
+ - Forward/reverse is a relay that the BLDC controller reads.
+
+ Result: drive, steering and gripper all work.
+
+
+--------------------------------------------------------------------------------
+ 2. OPERATOR CONSOLE (web UI)
+--------------------------------------------------------------------------------
+ A Flask web page served from the Pi so anyone on the network can drive it
+ from a phone. Built up over four revisions:
+
+ - drive forward/reverse + speed slider + exact-voltage entry box
+ - hold-to-move steering and gripper, plus timed runs
+ - go-to-angle steering once the AS5600 was working
+ - brake controls
+ - big E-stop, 2 s heartbeat watchdog (closed tab or WiFi drop = auto stop),
+   slew-limited throttle, direction can only change at idle
+
+ It runs on Raspberry Pi OS and starts on boot as a systemd service.
+ Current file: rpi_os_console/agv_console_angle.py
+
+
+--------------------------------------------------------------------------------
+ 3. CHOOSING AN OPERATING SYSTEM
+--------------------------------------------------------------------------------
+ ROS2 Jazzy needs Ubuntu 24.04. The motor scripts had been written on
+ Raspberry Pi OS. Ubuntu Server would not log in or connect to WiFi, so
+ Ubuntu 24.04 DESKTOP went on the Pi instead.
+
+ The result is TWO separate installs:
+   - Ubuntu 24.04  : ROS2, motor bridge, SLAM, IMU, all missions
+   - Raspberry Pi OS: the web console only
+
+ This split later caused a nasty bug (section 7).
+
+
+--------------------------------------------------------------------------------
+ 4. LIDAR + SLAM BRING-UP
+--------------------------------------------------------------------------------
+ - The apt package rplidar_ros could not start a scan on the C1. Its SDK
+   (1.12) predates the C1. Fix: build Slamtec's sllidar_ros2 from source
+   (SDK 2.1) in ~/aegis_ws. The C1 runs at 460800 baud.
+ - The odometry package rf2o refused to subscribe to /scan. It was dropped.
+   Instead a STATIC IDENTITY odom -> base_link transform is published, and
+   slam_toolbox's own scan matching supplies the pose. A stopgap.
+ - Handheld test: lidar and camera taped to a box, carried around a room.
+   Produced a clean map (~8.4 m x 14.5 m at 5 cm resolution).
+ - Lidar + slam_toolbox + OAK-D camera all ran together with CPU to spare.
+
+ A later map of a factory floor erased its pillars. That was NOT a 2D lidar
+ limitation (floor-to-ceiling pillars cross any scan plane). It was pose drift
+ making the occupancy grid "clear" the pillars from other viewpoints, which
+ happens without real odometry. Decision: do not buy a 3D lidar (Unitree L2);
+ fix odometry instead.
+
+
+--------------------------------------------------------------------------------
+ 5. THE LIDAR IS MOUNTED BACKWARDS
+--------------------------------------------------------------------------------
+ The C1 sits on the AGV rotated 180 degrees. Consequences:
+ - in the raw scan, the AGV's forward direction is bearing -180 degrees
+ - for SLAM, the base_link -> laser transform needs a 180 degree yaw
+   (--yaw 3.14159), or the map builds mirrored and headings are wrong
+
+
+--------------------------------------------------------------------------------
+ 6. ROS2 MOTOR BRIDGE
+--------------------------------------------------------------------------------
+ A ROS2 node that turns /cmd_vel into motor commands so that Nav2 can drive
+ the AGV later. Same safety ideas as the console: 0.5 s command watchdog,
+ slew limiting, direction interlock, E-stop topic.
+ Current file: ubuntu_ros2/agv_motor_bridge.py
+
+
+--------------------------------------------------------------------------------
+ 7. BUG: NOTHING MOVED ON UBUNTU (gpiochip)
+--------------------------------------------------------------------------------
+ Symptom: the bridge reported "steering left" and no errors, but no motor
+          moved. The identical wiring worked fine from Raspberry Pi OS.
+ Cause:   on Raspberry Pi OS the 40-pin header is gpiochip0. On Ubuntu it is
+          gpiochip4 (label "pinctrl-rp1"). Opening gpiochip0 on Ubuntu opens a
+          DIFFERENT chip and succeeds silently — every write "works" and no
+          pin ever changes.
+ Fix:     the bridge now finds the header chip by its label.
+ Lesson:  any GPIO code must auto-detect the chip.
+
+
+--------------------------------------------------------------------------------
+ 8. DRIVE SPEED, GRIPPER, DEMOS
+--------------------------------------------------------------------------------
+ - The drive does not move until a threshold voltage: 1.50 V forward,
+   1.28 V reverse. A single 1.4 V setting drove reverse but not forward.
+   The bridge now uses fixed 1.50 V forward / 1.28 V reverse.
+ - Gripper open/close were inverted. Now GPIO13 = open, GPIO12 = close.
+ - The two BTS7960 boards were swapped: BTS#1 (GPIO12/13) now runs the
+   gripper, BTS#2 (GPIO19/16) runs steering.
+ - DEMO 1: drive straight, stop before an obstacle (lidar only). Worked.
+ - DEMO 2: same in reverse. Worked.
+ - DEMO 3: drive either way, stop for anything in front OR behind. Worked.
+   File: ubuntu_ros2/agv_obstacle_guard.py
+
+
+--------------------------------------------------------------------------------
+ 9. BRAKE
+--------------------------------------------------------------------------------
+ A 24 V self-opening actuator on relay channel IN2. Shorting its two wires
+ applies it. It must NEVER be held energised, so it is pulsed:
+ - released at power-on
+ - one pulse when the drive stops, one pulse on E-stop
+ - every engagement auto-releases after 2 s at most
+ - a drive command releases it immediately
+ This makes it a stopping aid, not a parking brake.
+
+ Pins after some back-and-forth:  IN1 direction = GPIO5,  IN2 brake = GPIO6.
+ Still unverified: whether LOW applies or releases it.
+
+
+--------------------------------------------------------------------------------
+ 10. STEERING ANGLE (the long one)
+--------------------------------------------------------------------------------
+ The AS5600 magnetic encoder reads the steering angle. It took several rounds
+ to get right, and every round taught something:
+
+ a) Turns were timed at first (3.6 s per 360 deg). Not accurate under load.
+ b) Readings "wrapped" and the wheel spun 2-3 full turns when the software
+    limit was raised. Assumed: the encoder sat on a geared motor shaft.
+ c) The steered wheel has NO MECHANICAL END STOPS. It can spin forever.
+ d) Measured by hand-turning the wheel two full revolutions: ratio 1.002.
+    So the encoder IS on the steering pivot, 1:1. Nothing was wrong with it;
+    the wheel really was going past 360 degrees. No new sensor needed.
+ e) Left worked, right said "limit reached". Cause: a stale centre value.
+    The wheel rests wherever it was left, so the old centre was ~180 degrees
+    off. Fix: re-centre from the bridge with a topic command.
+ f) Left gave a NEGATIVE angle. Encoder sign inverted relative to the motor.
+    Fix: as5600_ccw_positive = false.
+ g) Stopped at +60 / -51 instead of +/-45. Cause: 20 Hz control loop plus
+    the wheel coasting after the motor cuts out. Fix: 50 Hz loop and a
+    look-ahead that stops early based on the measured turn rate. Left coasts
+    more than right — mechanical, tuned for the worse side.
+
+ Final settings: centre raw 3791, ccw_positive false, limit +/-45 deg,
+ 4 s maximum continuous steering run.
+
+
+--------------------------------------------------------------------------------
+ 11. HEADING — THE BNO085 IMU
+--------------------------------------------------------------------------------
+ Lidar yaw turned out to be useless while the vehicle turns (the scan smears).
+ - A compass/magnetometer was considered and REJECTED: steel drums and the
+   onboard motors would wreck it.
+ - BNO085 chosen. It cannot use I2C on a Pi (non-standard clock stretching),
+   so it runs in UART-RVC mode: three wires, streams heading at ~50 Hz.
+ - On Ubuntu the Pi 5's GPIO UART was missing. Only /dev/ttyAMA10 existed,
+   which is the separate debug header. Enabling UART0 in config.txt created
+   /dev/ttyAMA0.
+ - HEADING: works well, stable at rest. This fixed the turn accuracy.
+ - DISTANCE from the IMU: useless. It ran to 54 km in seconds. Two causes:
+     * the board is mounted ~17 deg off level, so gravity leaks into the
+       forward axis (2.95 m/s^2 while stationary)
+     * an accelerometer cannot tell steady cruising from standing still,
+       and double integration drifts as t-squared anyway
+   Fixes applied: 3 s startup calibration, zero-velocity updates only when
+   the bridge says the drive is idle, divergence flag. Even so: never use IMU
+   distance. Distance comes from lidar now and from wheel encoders soon.
+
+ Note: an earlier IMU node (archive/bno085_node.py) published /agv/heading.
+ A mission file that still listened for that topic waited forever. The
+ current pair of files both use /agv/imu.
+
+
+--------------------------------------------------------------------------------
+ 12. THE DRIVE-THEN-TURN MISSION
+--------------------------------------------------------------------------------
+ Task: drive N metres straight, then change the WHOLE vehicle's heading by
+ N degrees. The AGV cannot spin in place, so a turn = steer the front wheel
+ to lock, drive an arc, straighten.
+
+ - v1 commanded steering and driving together and hoped. Did not turn.
+ - v2 splits it into verified steps: steer to lock (confirmed by AS5600),
+   drive the arc, straighten.
+ - v3 uses each sensor for what it is good at:
+       distance -> lidar SLAM    heading -> BNO085    wheel -> AS5600
+   Result: correct distance, correct turn angle.
+ - Last problem: at the end the wheel swung through centre to the opposite
+   limit instead of straightening. Cause: the bridge published its status at
+   only 5 Hz, so at 100 deg/s the wheel moved 20 deg between samples and the
+   +/-4 deg "centred" window was never seen.
+   Fix: status raised to 20 Hz, and straightening now also stops as soon as
+   the wheel crosses zero. WRITTEN BUT NOT YET TESTED ON HARDWARE.
+
+ File: ubuntu_ros2/agv_drive_turn.py
+
+
+--------------------------------------------------------------------------------
+ 13. WHERE WE ARE RIGHT NOW
+--------------------------------------------------------------------------------
+ Working on hardware:
+   [x] lidar SLAM mapping
+   [x] all three motors from ROS2 on Ubuntu
+   [x] pulsed brake
+   [x] steering angle, limits and look-ahead
+   [x] BNO085 heading
+   [x] obstacle-stop demos (front, reverse, front+rear)
+   [x] drive N m then turn N deg — distance and turn angle both correct
+
+ Written, not yet tested:
+   [ ] straighten-at-the-end fix (zero-crossing + 20 Hz status)
+   [ ] hall-sensor wheel odometry tool (halls not wired yet)
+
+ Known gaps:
+   [ ] no real wheel odometry — still a static identity transform
+   [ ] IMU mounted ~17 deg off level
+   [ ] brake polarity never confirmed
+   [ ] the console's steering settings are stale (centre 3746, sign not
+       inverted) and it lacks the bridge's look-ahead
+   [ ] the bridge's built-in defaults are stale too — always launch it with
+       the explicit flags until they are fixed
+
+
+--------------------------------------------------------------------------------
+ 14. WHAT TO DO NEXT, IN ORDER
+--------------------------------------------------------------------------------
+ 1. Test the straighten fix. Pass = wheel ends within a few degrees of 0.
+    If not, turn on the bridge's closed-loop steering instead.
+
+ 2. Put the verified values into the code defaults (bridge AND console):
+    centre 3791, ccw_positive false, unwrap off. Port the gpiochip
+    auto-detect and the steering look-ahead into the console.
+
+ 3. Wire the hall sensors for distance:
+      - buy a BSS138 4-channel logic level converter module (~Rs 100)
+      - DO NOT use buck converters — they cannot carry a signal
+      - tap the three hall wires IN PARALLEL; never cut the motor harness;
+        never power anything from the hall 5 V wire
+      - halls -> converter -> GPIO17 / GPIO27 / GPIO22
+      - run: hall_odometry.py --check   (must see all 6 states)
+      - run: hall_odometry.py --calibrate --distance 5.0   (tape measure)
+
+ 4. Build the wheel odometry node: hall distance + steering angle through the
+    bicycle model, publish /odom and the odom->base_link transform. Retire
+    the static identity transform. Restore the SLAM travel thresholds.
+
+ 5. Fuse odometry and IMU with robot_localization (EKF). The IMU needs to
+    publish a proper sensor_msgs/Imu — archive/bno085_node.py already did;
+    port that into agv_imu_node.py.
+
+ 6. Nav2 configured for a car-like vehicle: Smac Hybrid-A* planner and
+    Regulated Pure Pursuit controller, minimum turning radius ~1.3 m.
+
+ 7. Drums: YOLO on the Hailo for detection, ArUco tags for identity, camera
+    depth for the final approach, then the pick-and-place state machine.
+
+ Housekeeping when convenient:
+   - shim the IMU level
+   - udev rules so serial devices keep fixed names after reboot
+   - put the folder under git
+
+
+--------------------------------------------------------------------------------
+ 15. LESSONS LEARNED — DO NOT REPEAT THESE
+--------------------------------------------------------------------------------
+ - Never pile patch on patch. It left duplicate functions and duplicate ROS
+   parameter declarations, and ROS2 crashes on a duplicate. Rewrite clean.
+ - A GPIO write that "succeeds" proves nothing. Check the gpiochip.
+ - Verify every sign by watching the hardware: left must read positive,
+   forward must move forward.
+ - Anything doing closed-loop control over a topic needs the topic fast
+   enough. 100 deg/s at 5 Hz is 20 deg per sample.
+ - Say pin numbers back before coding. A GPIO5/GPIO6 mix-up cost a rewrite.
+ - Use each sensor for what it does well. No single sensor gives exact
+   position or heading on its own.
+ - Wheels off the ground and a dry run before any live test.
+================================================================================
