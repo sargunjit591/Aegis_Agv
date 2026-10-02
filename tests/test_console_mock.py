@@ -105,10 +105,18 @@ for cmd, sign in (('left', 1), ('right', -1)):
           f'(want {sign * 40:+d}..{sign * 47:+d})')
     check(pins.get(con.STEER_LPWM) == 0 and pins.get(con.STEER_RPWM) == 0,
           f'  both steering pins inactive (GPIO{con.STEER_LPWM}=0, GPIO{con.STEER_RPWM}=0)')
-    hw.steer(cmd)                   # press again: must not get any further
-    time.sleep(0.5)
-    check(hw.steer_state == 'stop' and sign * hw.angle_deg <= 47.0,
-          f'  {cmd} again at the limit goes nowhere ({hw.angle_deg:+.1f} deg)')
+    # Press again, five times. A press that starts a hair INSIDE the limit is
+    # allowed, is cut on the next tick and coasts: one bounded overshoot (same
+    # as the bridge). Once the wheel rests at or past the limit, every further
+    # press is refused outright, so presses cannot walk the wheel away.
+    for _ in range(5):
+        hw.steer(cmd)
+        time.sleep(0.4)
+    a = hw.angle_deg
+    hw.steer(cmd)
+    check(hw.steer_state == 'stop' and 45.0 <= sign * a <= 61.0,
+          f'  {cmd} pressed 5 more times: wheel rests at {a:+.1f} deg '
+          f'(bounded: limit + one coast), next press refused')
 back = hw.angle_deg
 hw.steer('left')
 time.sleep(0.15)
