@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 ============================================================
-PROJECT AEGIS — AGV OPERATOR CONSOLE  [REV 4]
+PROJECT AEGIS — AGV OPERATOR CONSOLE  [REV 5]
 ============================================================
 Run on the Pi, open http://<pi-ip>:8000 from any phone/laptop.
+NEVER run this and the ROS2 motor bridge at the same time.
 
-HARDWARE MAP
+HARDWARE MAP  (must match ubuntu_ros2/agv_motor_bridge.py)
   Steering : BTS7960 #2  GPIO19=RPWM(right) GPIO16=LPWM(left)  active HIGH
   Gripper  : BTS7960 #1  GPIO13=RPWM(open)  GPIO12=LPWM(close) active LOW
   Dir relay: relay IN1   GPIO5   LOW = FORWARD, HIGH = REVERSE
@@ -14,7 +15,21 @@ HARDWARE MAP
   Throttle : Waveshare HAT DAC0, SPI(0,1) mode 1, CS = GPIO23
              0.80 V idle ... 4.20 V max
              measured start thresholds: forward 1.50 V, reverse 1.28 V
-  Steering feedback : AS5600, I2C bus 1 @ 0x36, centre raw 3746
+  Steering feedback : AS5600, I2C bus 1 @ 0x36, 1:1 on the steering
+             pivot, single-turn, centre raw 3791, LEFT reads POSITIVE
+
+STEERING
+  The wheel has NO end stops, so software is the only limit:
+    * +/-45 deg limit on EVERY steering move (hold, timed, go-to),
+      with rate look-ahead: the motor is cut when the PREDICTED angle
+      reaches the limit, because the wheel coasts after the cut
+    * go-to-angle uses the same look-ahead to land on the target
+    * no continuous run longer than STEER_MAX_RUN_S
+    * runaway guard on go-to (angle moving away from the target)
+  If the startup angle is not ~0 with the wheel straight, the centre
+  is stale: straighten the wheel and press "Set 0° here". If the angle
+  jumps +/-170 -> -/+170 the wheel crossed the encoder seam — stop
+  and re-centre.
 
 BRAKE — PULSED, NEVER HELD
   The actuator is self-opening, so it must not sit energised:
@@ -40,6 +55,12 @@ THE OTHER THING THAT MAY NEED FLIPPING
   FORWARD_RELAY_LEVEL — 0 means GPIO5 LOW is forward. If the AGV
   drives backwards when told forward, change it to 1.
 
+GPIOCHIP
+  The 40-pin header is gpiochip0 on Raspberry Pi OS but gpiochip4
+  on Ubuntu 24.04. Opening the wrong one succeeds silently and no
+  pin ever moves, so the chip is detected by label. Override with
+  GPIOCHIP below.
+
 DEPENDENCIES
   pip install flask lgpio spidev smbus2 --break-system-packages
 
@@ -48,15 +69,19 @@ steering angle, so the whole UI is testable off-Pi.
 ============================================================
 """
 
+import atexit
+import re
+import subprocess
 import threading
 import time
-import atexit
 
 from flask import Flask, request, jsonify, Response
 
 # ==================================================================
 # CONFIG — every tunable lives here, exactly once
 # ==================================================================
+
+GPIOCHIP = -1            # -1 = auto-detect the 40-pin header by label
 
 # ---- steering: BTS7960 #2 ----
 STEER_RPWM = 19          # right
@@ -74,7 +99,7 @@ FORWARD_RELAY_LEVEL = 0  # 0 = LOW is forward; change to 1 if reversed
 
 # ---- mechanical brake: relay IN2 ----
 BRAKE_PIN = 6            # IN2 — brake actuator
-BRAKE_ENGAGE_LEVEL = 0   # 0 = LOW applies the brake (active-LOW relay)
+BRAKE_ENGAGE_LEVEL = 0   # 0 = LOW applies the brake (UNVERIFIED polarity)
 BRAKE_ENABLE = True
 BRAKE_RELEASE_LEAD_S = 0.35   # brake lets go this long before throttle rises
 BRAKE_MAX_ENGAGE_S = 2.0      # HARD LIMIT — auto-release after this long.
@@ -89,21 +114,26 @@ THROTTLE_IDLE_V = 0.80
 THROTTLE_MAX_V = 4.20
 SPEED_CAP_PCT = 100      # lower (e.g. 50) to cap top speed for new operators
 
-# ---- AS5600 steering encoder ----
+# ---- AS5600 steering encoder (1:1 on the pivot, single-turn) ----
 AS5600_BUS = 1
 AS5600_ADDR = 0x36
-AS5600_CENTER_RAW = 3746
-AS5600_CCW_POSITIVE = True
+AS5600_CENTER_RAW = 3791      # raw reading with the wheel straight
+AS5600_CCW_POSITIVE = False   # False => steering LEFT reads POSITIVE
 
-# ---- steering closed loop ----
+# ---- steering control ----
 STEER_MAX_DEG = 45.0
 STEER_DEADBAND_DEG = 1.5
 STEER_SEEK_TIMEOUT_S = 12.0
-STEER_RUNAWAY_TICKS = 10
+STEER_RUNAWAY_S = 0.5         # go-to error growing this long = runaway
+STEER_MAX_RUN_S = 4.0         # backstop: never run the steering motor
+                              # continuously longer than this
+STEER_STOP_LEAD_S = 0.12      # stop this far AHEAD of a limit/target, scaled
+                              # by the measured turn rate (latency + coast)
+STEER_RATE_ALPHA = 0.35       # smoothing on the rate estimate
 
 # ---- timing ----
-SLEW_STEP_V = 0.15
-CONTROL_TICK_S = 0.05    # 20 Hz
+CONTROL_TICK_S = 0.02    # 50 Hz — at 100 deg/s the wheel moves 2 deg per tick
+SLEW_V_PER_S = 3.0       # throttle slew limit
 WATCHDOG_TIMEOUT_S = 2.0
 TIMED_MAX_S = 15.0
 
@@ -111,6 +141,9 @@ TIMED_MAX_S = 15.0
 MOCK_STEER_RATE_DPS = 100.0
 
 HTTP_PORT = 8000
+
+SLEW_STEP_V = SLEW_V_PER_S * CONTROL_TICK_S
+STEER_RUNAWAY_TICKS = round(STEER_RUNAWAY_S / CONTROL_TICK_S)
 
 # ==================================================================
 try:
@@ -126,6 +159,67 @@ try:
     HAVE_SMBUS = True
 except ImportError:
     HAVE_SMBUS = False
+
+
+def find_header_chip(requested=-1, log=print):
+    """Number of the gpiochip that owns the 40-pin header.
+
+    It is gpiochip0 on Raspberry Pi OS and gpiochip4 on Ubuntu 24.04.
+    Opening the wrong chip succeeds silently and no pin ever moves, so
+    match on the chip label. Keep identical in bridge and console."""
+    if requested is not None and int(requested) >= 0:
+        log(f'gpiochip{int(requested)} set explicitly')
+        return int(requested)
+
+    chips = {}                                  # n -> (label, lines)
+    for n in range(8):
+        try:
+            h = lgpio.gpiochip_open(n)
+        except Exception:
+            continue
+        try:
+            info = lgpio.gpio_get_chip_info(h)
+            if isinstance(info, (list, tuple)) and len(info) >= 4:
+                lines, label = info[1], info[3]
+            else:
+                lines, label = getattr(info, 'lines', 0), getattr(info, 'label', '')
+            if isinstance(label, bytes):
+                label = label.decode(errors='ignore')
+            chips[n] = (str(label), int(lines))
+        except Exception:
+            pass
+        finally:
+            try:
+                lgpio.gpiochip_close(h)
+            except Exception:
+                pass
+
+    if not chips:                               # fall back to gpiodetect
+        try:
+            out = subprocess.run(['gpiodetect'], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except Exception:
+            out = ''
+        for line in out.splitlines():
+            m = re.match(r'gpiochip(\d+)\s+\[([^\]]+)\]\s+\((\d+) lines\)',
+                         line.strip())
+            if m:
+                chips[int(m.group(1))] = (m.group(2), int(m.group(3)))
+
+    for n in sorted(chips):
+        log(f'  gpiochip{n}: {chips[n][0]!r} ({chips[n][1]} lines)')
+    for n in sorted(chips):
+        label = chips[n][0].lower()
+        if 'rp1' in label or 'bcm2835' in label or 'bcm2711' in label:
+            log(f'40-pin header = gpiochip{n} (by label)')
+            return n
+    for n in sorted(chips):
+        if chips[n][1] == 54:
+            log(f'40-pin header = gpiochip{n} (54 lines)')
+            return n
+    log('ERROR: 40-pin header NOT identified — falling back to gpiochip0. '
+        'If no pin moves, set the chip number explicitly.')
+    return 0
 
 
 class Hardware:
@@ -149,20 +243,29 @@ class Hardware:
         self.brake_was_moving = False
         self.brake_manual = None         # None = auto, True/False = override
 
-        # steering closed loop
-        self.angle_deg = None
+        # steering
+        self.center_raw = AS5600_CENTER_RAW
+        self.last_raw = None
+        self.angle_deg = None            # + = left, None = no encoder
+        self.steer_rate_dps = 0.0        # measured wheel turn rate
         self.seek_target = None
         self.seek_started = 0.0
         self.steer_fault = None
-        self._prev_abs_err = None
+        self._rate_prev = None           # (angle, time) of the last sample
+        self._prev_abs_deg = None
+        self._steer_away_cmd = None      # learned: which command leaves centre
+        self._steer_since = None         # when the motor last started
+        self._prev_abs_err = None        # go-to runaway guard
         self._worsening = 0
         self._mock_angle = 0.0
+        self._mock_rate = 0.0
+        self._mock_coast_until = 0.0
         self._mock_last = time.monotonic()
 
         self.as5600 = None
 
         if not MOCK:
-            self.h = lgpio.gpiochip_open(0)
+            self.h = lgpio.gpiochip_open(find_header_chip(GPIOCHIP))
             lgpio.gpio_claim_output(self.h, STEER_RPWM, 1 if STEER_ACTIVE_LOW else 0)
             lgpio.gpio_claim_output(self.h, STEER_LPWM, 1 if STEER_ACTIVE_LOW else 0)
             lgpio.gpio_claim_output(self.h, GRIP_RPWM, 1 if GRIP_ACTIVE_LOW else 0)
@@ -183,11 +286,16 @@ class Hardware:
         if HAVE_SMBUS and not MOCK:
             try:
                 self.as5600 = smbus2.SMBus(AS5600_BUS)
-                print(f"[AS5600] OK — centre raw {AS5600_CENTER_RAW}, "
-                      f"now {self.read_angle():+.1f} deg")
+                deg = self.read_angle()
+                print(f"[AS5600] OK — centre raw {self.center_raw}, now {deg:+.1f} deg")
+                if abs(deg) > 10.0:
+                    print(f"[AS5600] startup angle is {deg:+.1f} deg, not ~0 — "
+                          f"straighten the wheel, or press 'Set 0° here' if "
+                          f"the wheel IS straight")
             except Exception as e:
                 self.as5600 = None
-                print(f"[AS5600] UNAVAILABLE: {e} — angle features disabled")
+                print(f"[AS5600] UNAVAILABLE: {e} — angle features and the "
+                      f"steering angle limit are disabled")
 
     # ---------- low-level ----------
     def _pin(self, pin, active, active_low):
@@ -240,32 +348,66 @@ class Hardware:
             return True, f"brake: {'APPLIED' if self.brake_manual else 'RELEASED'} (manual)"
 
     # ---------- AS5600 ----------
+    def _read_raw(self):
+        hi = self.as5600.read_byte_data(AS5600_ADDR, 0x0E)
+        lo = self.as5600.read_byte_data(AS5600_ADDR, 0x0F)
+        self.last_raw = ((hi << 8) | lo) & 0x0FFF
+        return self.last_raw
+
     def read_angle(self):
-        """Signed degrees from centre. Wrap-safe for a centre near 0/4095."""
+        """Signed degrees from centre, + = left. Wrap-safe for a centre
+        near 0/4095."""
         if MOCK:
             return self._mock_angle
         if self.as5600 is None:
             return None
-        hi = self.as5600.read_byte_data(AS5600_ADDR, 0x0E)
-        lo = self.as5600.read_byte_data(AS5600_ADDR, 0x0F)
-        raw = ((hi << 8) | lo) & 0x0FFF
-        diff = (raw - AS5600_CENTER_RAW + 2048) % 4096 - 2048
+        diff = (self._read_raw() - self.center_raw + 2048) % 4096 - 2048
         deg = diff * (360.0 / 4096.0)
         return deg if AS5600_CCW_POSITIVE else -deg
 
+    def home_steering(self):
+        """Declare the CURRENT wheel position to be straight ahead (0 deg).
+        Lasts until restart — edit AS5600_CENTER_RAW to keep it."""
+        with self.lock:
+            if self.steer_state != "stop" or self.seek_target is not None:
+                return False, "Stop steering first"
+            if MOCK:
+                self._mock_angle = 0.0
+                return True, "centre set (mock)"
+            if self.as5600 is None:
+                return False, "AS5600 unavailable"
+            try:
+                raw = self._read_raw()
+            except Exception as e:
+                return False, f"AS5600 read failed: {e}"
+            self.center_raw = raw
+            self.steer_fault = None
+            self._prev_abs_err = None
+            self._worsening = 0
+            print(f"[AS5600] centre set to raw {raw} — put it in "
+                  f"AS5600_CENTER_RAW to keep it")
+            return True, f"centre = raw {raw} (edit AS5600_CENTER_RAW to keep)"
+
     def _mock_step(self):
+        """Simulated wheel: MOCK_STEER_RATE_DPS while driven, then coasts
+        for STEER_STOP_LEAD_S after the motor is cut."""
         now = time.monotonic()
         dt = now - self._mock_last
         self._mock_last = now
-        if self.steer_state == "left":
-            self._mock_angle += MOCK_STEER_RATE_DPS * dt
-        elif self.steer_state == "right":
-            self._mock_angle -= MOCK_STEER_RATE_DPS * dt
-        self._mock_angle = max(-60.0, min(60.0, self._mock_angle))
+        if self.steer_state in ("left", "right"):
+            self._mock_rate = (MOCK_STEER_RATE_DPS if self.steer_state == "left"
+                               else -MOCK_STEER_RATE_DPS)
+            self._mock_coast_until = now + STEER_STOP_LEAD_S
+        elif now >= self._mock_coast_until:
+            self._mock_rate = 0.0
+        self._mock_angle += self._mock_rate * dt
 
     # ---------- steering ----------
     def _steer_hw(self, cmd):
+        """The ONLY place the steering pins are written."""
         self.action_token["steer"] += 1
+        if cmd in ("left", "right") and self.steer_state != cmd:
+            self._steer_since = time.monotonic()
         self._pin(STEER_RPWM, cmd == "right", STEER_ACTIVE_LOW)
         self._pin(STEER_LPWM, cmd == "left", STEER_ACTIVE_LOW)
         self.steer_state = cmd
@@ -276,14 +418,52 @@ class Hardware:
             if self.estopped and cmd != "stop":
                 return self.action_token["steer"]
             self.seek_target = None          # manual overrides a seek
+            if cmd != "stop" and self.at_limit(cmd):
+                cmd = "stop"
             return self._steer_hw(cmd)
 
-    def at_limit(self, cmd, angle):
+    def _update_angle(self, angle, now):
+        """Store the angle, estimate the turn rate, and learn which command
+        drives the wheel AWAY from centre (for the >90 deg backstop)."""
+        self.angle_deg = angle
         if angle is None:
+            self._rate_prev = None
+            return
+        if self._rate_prev is not None:
+            dt = now - self._rate_prev[1]
+            if dt > 1e-4:
+                raw_rate = (angle - self._rate_prev[0]) / dt
+                self.steer_rate_dps = (STEER_RATE_ALPHA * raw_rate
+                                       + (1.0 - STEER_RATE_ALPHA) * self.steer_rate_dps)
+        self._rate_prev = (angle, now)
+
+        if (self._prev_abs_deg is not None
+                and self.steer_state in ("left", "right")
+                and abs(angle) > self._prev_abs_deg + 0.2):
+            self._steer_away_cmd = self.steer_state
+        self._prev_abs_deg = abs(angle)
+
+    def at_limit(self, cmd):
+        """True if steering further in direction cmd must be refused."""
+        if self.angle_deg is None:
             return False
-        if cmd == "left" and angle >= STEER_MAX_DEG:
+
+        # Normal range, with LOOK-AHEAD. The wheel keeps moving for a moment
+        # after the motor is cut (loop latency + mechanical coast), so stop
+        # when the PREDICTED angle would exceed the limit, not the current one.
+        pred = self.angle_deg + self.steer_rate_dps * STEER_STOP_LEAD_S
+        if cmd == "left" and pred >= STEER_MAX_DEG:
             return True
-        if cmd == "right" and angle <= -STEER_MAX_DEG:
+        if cmd == "right" and pred <= -STEER_MAX_DEG:
+            return True
+
+        # Backstop. Past 90 deg either the centre is wrong or a sign is
+        # inverted. Block only the direction taking us FURTHER from centre
+        # so the wheel can still be steered back.
+        if abs(self.angle_deg) > 90.0 and self._steer_away_cmd == cmd:
+            self.steer_fault = (f"Wheel is {self.angle_deg:+.0f} deg from centre — "
+                                f"centre is stale (use 'Set 0° here') or "
+                                f"AS5600_CCW_POSITIVE is wrong.")
             return True
         return False
 
@@ -299,6 +479,7 @@ class Hardware:
                 return False, "Invalid angle"
             if abs(deg) > STEER_MAX_DEG:
                 return False, f"Limit is +/-{STEER_MAX_DEG:.0f} deg"
+            self._steer_hw("stop")           # the seek decides the direction
             self.steer_fault = None
             self._prev_abs_err = None
             self._worsening = 0
@@ -311,48 +492,68 @@ class Hardware:
             self.seek_target = None
             self._steer_hw("stop")
 
-    def _seek_tick(self, angle):
+    def _seek_done(self, fault=None):
+        if fault:
+            self.steer_fault = fault
+        self.seek_target = None
+        self._prev_abs_err = None
+        self._worsening = 0
+        self._steer_hw("stop")
+
+    def _seek_tick(self, now):
+        angle = self.angle_deg
         if self.seek_target is None or angle is None:
             return
-        if time.monotonic() - self.seek_started > STEER_SEEK_TIMEOUT_S:
-            self.steer_fault = "Seek timed out"
-            self.seek_target = None
-            self._steer_hw("stop")
+        if now - self.seek_started > STEER_SEEK_TIMEOUT_S:
+            self._seek_done("Seek timed out")
             return
 
-        err = self.seek_target - angle
-        abs_err = abs(err)
-
-        if abs_err <= STEER_DEADBAND_DEG:
-            self.seek_target = None
-            self._steer_hw("stop")
-            self._prev_abs_err = None
-            self._worsening = 0
-            return
-
+        # LOOK-AHEAD: steer on where the wheel will be once it has coasted.
+        err = self.seek_target - (angle + self.steer_rate_dps * STEER_STOP_LEAD_S)
         cmd = "left" if err > 0 else "right"
-        if self.at_limit(cmd, angle):
-            self.steer_fault = f"Mechanical limit ({cmd})"
-            self.seek_target = None
-            self._steer_hw("stop")
+        moving = self.steer_state in ("left", "right")
+
+        # Done inside the band, or as soon as the predicted angle has crossed
+        # the target — at ~2 deg per tick a narrow band can be stepped over,
+        # and reversing the motor to chase it would hunt.
+        if abs(err) <= STEER_DEADBAND_DEG or (moving and cmd != self.steer_state):
+            self._seek_done()
             return
 
-        if self.steer_state in ("left", "right") and self._prev_abs_err is not None:
+        if self.at_limit(cmd):
+            self._seek_done(self.steer_fault or f"Mechanical limit ({cmd})")
+            return
+
+        # runaway guard, on the MEASURED error
+        abs_err = abs(self.seek_target - angle)
+        if moving and self._prev_abs_err is not None:
             if abs_err > self._prev_abs_err + 1e-4:
                 self._worsening += 1
             else:
                 self._worsening = 0
             if self._worsening >= STEER_RUNAWAY_TICKS:
-                self.steer_fault = ("RUNAWAY — angle moved away from target. "
-                                    "Flip AS5600_CCW_POSITIVE or swap "
-                                    "STEER_RPWM/STEER_LPWM.")
-                self.seek_target = None
-                self._steer_hw("stop")
+                self._seek_done("RUNAWAY — angle moved away from target. "
+                                "Flip AS5600_CCW_POSITIVE or swap "
+                                "STEER_RPWM/STEER_LPWM.")
                 return
         self._prev_abs_err = abs_err
 
         if self.steer_state != cmd:
             self._steer_hw(cmd)
+
+    def _steer_guard(self, now):
+        """Limits for ANY steering motion — hold, timed or go-to. The wheel
+        has no end stops, so this is the only thing that stops it."""
+        if self.steer_state not in ("left", "right"):
+            return
+        if self.at_limit(self.steer_state):
+            self.seek_target = None
+            self._steer_hw("stop")
+        elif now - self._steer_since > STEER_MAX_RUN_S:
+            self.seek_target = None
+            self._steer_hw("stop")
+            self.steer_fault = (f"Steering ran {STEER_MAX_RUN_S:.1f} s "
+                                f"continuously — stopped.")
 
     # ---------- gripper ----------
     def grip(self, cmd):
@@ -404,6 +605,7 @@ class Hardware:
         with self.lock:
             if self.estopped:
                 return False, "E-stop active"
+            # direction interlock — only switch the relay at idle
             if (self.current_v > THROTTLE_IDLE_V + 0.05
                     or self.target_v > THROTTLE_IDLE_V + 0.05):
                 return False, "Bring speed to 0 before changing direction"
@@ -414,7 +616,11 @@ class Hardware:
         with self.lock:
             if self.estopped:
                 return False, "E-stop active"
-            pct = max(0.0, min(float(SPEED_CAP_PCT), float(pct)))
+            try:
+                pct = float(pct)
+            except (TypeError, ValueError):
+                return False, "Invalid speed"
+            pct = max(0.0, min(float(SPEED_CAP_PCT), pct))
             self.target_v = THROTTLE_IDLE_V + (pct / 100.0) * (THROTTLE_MAX_V - THROTTLE_IDLE_V)
             return True, pct
 
@@ -426,57 +632,45 @@ class Hardware:
                 v = float(volts)
             except (TypeError, ValueError):
                 return False, "Invalid voltage"
-            clamped = False
-            if v < THROTTLE_IDLE_V:
-                v, clamped = THROTTLE_IDLE_V, True
-            if v > THROTTLE_MAX_V:
-                v, clamped = THROTTLE_MAX_V, True
             cap_v = THROTTLE_IDLE_V + (SPEED_CAP_PCT / 100.0) * (THROTTLE_MAX_V - THROTTLE_IDLE_V)
-            capped = False
+            msg = ""
+            if not THROTTLE_IDLE_V <= v <= THROTTLE_MAX_V:
+                v = max(THROTTLE_IDLE_V, min(THROTTLE_MAX_V, v))
+                msg = " (clamped)"
             if v > cap_v:
-                v, capped = cap_v, True
+                v, msg = cap_v, f" (cap {SPEED_CAP_PCT:.0f}%)"
             self.target_v = v
-            msg = f"{v:.2f} V"
-            if capped:
-                msg += f" (cap {SPEED_CAP_PCT:.0f}%)"
-            elif clamped:
-                msg += " (clamped)"
-            return True, msg
+            return True, f"{v:.2f} V{msg}"
 
     # ---------- safety ----------
+    def _outputs_off(self):
+        """Steering and gripper off, any timed run or seek cancelled."""
+        self.seek_target = None
+        self._steer_hw("stop")
+        self.action_token["grip"] += 1
+        self._pin(GRIP_RPWM, False, GRIP_ACTIVE_LOW)
+        self._pin(GRIP_LPWM, False, GRIP_ACTIVE_LOW)
+        self.grip_state = "stop"
+
     def all_stop(self):
+        """Watchdog stop: throttle slews to idle, brake pulse, outputs off."""
         with self.lock:
-            self.action_token["steer"] += 1
-            self.action_token["grip"] += 1
-            self.seek_target = None
             self.target_v = THROTTLE_IDLE_V
             self.brake_manual = None
             self.brake_pulse_spent = False
             self._brake(True)              # pulse; auto-releases on the limit
-            self._pin(STEER_RPWM, False, STEER_ACTIVE_LOW)
-            self._pin(STEER_LPWM, False, STEER_ACTIVE_LOW)
-            self._pin(GRIP_RPWM, False, GRIP_ACTIVE_LOW)
-            self._pin(GRIP_LPWM, False, GRIP_ACTIVE_LOW)
-            self.steer_state = "stop"
-            self.grip_state = "stop"
+            self._outputs_off()
 
     def estop(self):
+        """E-stop: throttle to idle NOW, brake pulse, outputs off, latched."""
         with self.lock:
             self.estopped = True
-            self.action_token["steer"] += 1
-            self.action_token["grip"] += 1
-            self.seek_target = None
             self.target_v = self.current_v = THROTTLE_IDLE_V
             self._write_dac(THROTTLE_IDLE_V)
             self.brake_manual = None
             self.brake_pulse_spent = False
             self._brake(True)              # pulse; auto-releases on the limit
-            self._pin(STEER_RPWM, False, STEER_ACTIVE_LOW)
-            self._pin(STEER_LPWM, False, STEER_ACTIVE_LOW)
-            self._pin(GRIP_RPWM, False, GRIP_ACTIVE_LOW)
-            self._pin(GRIP_LPWM, False, GRIP_ACTIVE_LOW)
-            self.steer_state = "stop"
-            self.grip_state = "stop"
+            self._outputs_off()
 
     def estop_reset(self):
         with self.lock:
@@ -499,12 +693,13 @@ class Hardware:
             a = None
 
         with self.lock:
-            self.angle_deg = a
+            now_t = time.monotonic()
+            self._update_angle(a, now_t)
             if not self.estopped:
-                self._seek_tick(a)
+                self._seek_tick(now_t)
+            self._steer_guard(now_t)
 
             wants_drive = self.target_v > THROTTLE_IDLE_V + 0.05
-            now_t = time.monotonic()
 
             # ---- brake: PULSE, never held ----
             if BRAKE_ENABLE:
@@ -539,9 +734,10 @@ class Hardware:
                 if self.brake_engaged:
                     eff_target = THROTTLE_IDLE_V
                 elif (self.brake_released_at is not None and
-                      (time.monotonic() - self.brake_released_at) < BRAKE_RELEASE_LEAD_S):
+                      (now_t - self.brake_released_at) < BRAKE_RELEASE_LEAD_S):
                     eff_target = THROTTLE_IDLE_V
 
+            # slew-limited DAC
             if abs(eff_target - self.current_v) >= 0.001:
                 delta = eff_target - self.current_v
                 self.current_v += max(-SLEW_STEP_V, min(SLEW_STEP_V, delta))
@@ -592,6 +788,10 @@ threading.Thread(target=control_loop, daemon=True).start()
 app = Flask(__name__)
 
 
+def body():
+    return request.get_json(silent=True) or {}
+
+
 @app.route("/api/heartbeat", methods=["POST"])
 def heartbeat():
     global last_heartbeat, watchdog_tripped
@@ -614,8 +814,11 @@ def status():
         brake_mode=("auto" if hw.brake_manual is None else "manual"),
         brake_max_s=BRAKE_MAX_ENGAGE_S,
         angle_deg=(round(hw.angle_deg, 1) if hw.angle_deg is not None else None),
+        steer_rate_dps=round(hw.steer_rate_dps, 1),
         seek_target=(round(hw.seek_target, 1) if hw.seek_target is not None else None),
         steer_fault=hw.steer_fault,
+        as5600_raw=hw.last_raw,
+        as5600_center_raw=hw.center_raw,
         encoder_ok=(hw.as5600 is not None or MOCK),
         mock=MOCK,
     )
@@ -623,7 +826,7 @@ def status():
 
 @app.route("/api/steer", methods=["POST"])
 def api_steer():
-    cmd = (request.json or {}).get("cmd", "stop")
+    cmd = body().get("cmd", "stop")
     if cmd not in ("left", "right", "stop"):
         return jsonify(ok=False, msg="bad cmd"), 400
     hw.steer(cmd)
@@ -632,7 +835,7 @@ def api_steer():
 
 @app.route("/api/steer_to", methods=["POST"])
 def api_steer_to():
-    ok, msg = hw.seek_angle((request.json or {}).get("deg"))
+    ok, msg = hw.seek_angle(body().get("deg"))
     return jsonify(ok=ok, msg=msg)
 
 
@@ -642,18 +845,24 @@ def api_steer_cancel():
     return jsonify(ok=True)
 
 
+@app.route("/api/steer_home", methods=["POST"])
+def api_steer_home():
+    ok, msg = hw.home_steering()
+    return jsonify(ok=ok, msg=msg)
+
+
 @app.route("/api/steer_timed", methods=["POST"])
 def api_steer_timed():
-    d = (request.json or {}).get("dir")
+    d = body().get("dir")
     if d not in ("left", "right"):
         return jsonify(ok=False, msg="bad dir"), 400
-    ok, res = hw.timed("steer", d, (request.json or {}).get("secs"))
+    ok, res = hw.timed("steer", d, body().get("secs"))
     return jsonify(ok=ok, msg=(f"{d} for {res:.2f}s" if ok else res))
 
 
 @app.route("/api/grip", methods=["POST"])
 def api_grip():
-    cmd = (request.json or {}).get("cmd", "stop")
+    cmd = body().get("cmd", "stop")
     if cmd not in ("open", "close", "stop"):
         return jsonify(ok=False, msg="bad cmd"), 400
     hw.grip(cmd)
@@ -662,16 +871,16 @@ def api_grip():
 
 @app.route("/api/grip_timed", methods=["POST"])
 def api_grip_timed():
-    cmd = (request.json or {}).get("cmd")
+    cmd = body().get("cmd")
     if cmd not in ("open", "close"):
         return jsonify(ok=False, msg="bad cmd"), 400
-    ok, res = hw.timed("grip", cmd, (request.json or {}).get("secs"))
+    ok, res = hw.timed("grip", cmd, body().get("secs"))
     return jsonify(ok=ok, msg=(f"{cmd} for {res:.2f}s" if ok else res))
 
 
 @app.route("/api/brake", methods=["POST"])
 def api_brake():
-    mode = (request.json or {}).get("mode", "auto")
+    mode = body().get("mode", "auto")
     if mode not in ("auto", "apply", "release"):
         return jsonify(ok=False, msg="bad mode"), 400
     ok, msg = hw.set_brake_mode(mode)
@@ -680,7 +889,7 @@ def api_brake():
 
 @app.route("/api/direction", methods=["POST"])
 def api_direction():
-    d = (request.json or {}).get("dir")
+    d = body().get("dir")
     if d not in ("forward", "reverse"):
         return jsonify(ok=False, msg="bad dir"), 400
     ok, msg = hw.set_direction(d)
@@ -689,13 +898,13 @@ def api_direction():
 
 @app.route("/api/speed", methods=["POST"])
 def api_speed():
-    ok, msg = hw.set_speed_percent((request.json or {}).get("pct", 0))
+    ok, msg = hw.set_speed_percent(body().get("pct", 0))
     return jsonify(ok=ok, msg=msg)
 
 
 @app.route("/api/voltage", methods=["POST"])
 def api_voltage():
-    ok, msg = hw.set_voltage((request.json or {}).get("volts"))
+    ok, msg = hw.set_voltage(body().get("volts"))
     return jsonify(ok=ok, msg=msg)
 
 
@@ -912,7 +1121,10 @@ font-family:"Courier New",monospace;letter-spacing:.08em;}
       <button class="mini-btn" id="secLeft">◀ Run</button>
       <button class="mini-btn" id="secRight">Run ▶</button>
     </div>
-    <div class="hint" id="steerHint">Closed loop on encoder · limit ±45°</div>
+    <div class="row">
+      <button class="mini-btn wide" id="btnHome">Set 0° here</button>
+    </div>
+    <div class="hint" id="steerHint">Limit ±45° with look-ahead · max 4 s run</div>
     <div class="fault" id="steerFault"></div>
   </section>
 
@@ -941,7 +1153,7 @@ font-family:"Courier New",monospace;letter-spacing:.08em;}
   </section>
 </main>
 
-<footer>PROJECT AEGIS · REV 4 · AS5600 CLOSED-LOOP STEERING · BRAKE ON IN2 · WATCHDOG 2.0 S</footer>
+<footer>PROJECT AEGIS · REV 5 · AS5600 CLOSED-LOOP STEERING · BRAKE ON IN2 · WATCHDOG 2.0 S</footer>
 
 <script>
 const $=id=>document.getElementById(id);
@@ -1014,7 +1226,7 @@ function flash(id,msg,ok,orig){
   setTimeout(()=>{h.textContent=orig;h.style.color="";},2600);
 }
 const VOLT_ORIG="Throttle 0.80 – 4.20 V · starts moving ~1.50 fwd / 1.28 rev";
-const STEER_ORIG="Closed loop on encoder · limit ±45°";
+const STEER_ORIG="Limit ±45° with look-ahead · max 4 s run";
 const GRIP_ORIG="Hold to move jaws · or timed run";
 const BRK_ORIG="IN2 GPIO6 · pulses on stop, auto-releases after 2 s";
 
@@ -1063,6 +1275,10 @@ $("targetDeg").addEventListener("keydown",e=>{
 $("btnCenter").onclick=()=>goTo(0);
 $("btnCancel").onclick=async()=>{await post("/api/steer_cancel");
   await post("/api/clear_fault"); flash("steerHint","Cancelled",true,STEER_ORIG);};
+$("btnHome").onclick=async()=>{
+  if(!confirm("Is the front wheel STRAIGHT? This position becomes 0°."))return;
+  const r=await post("/api/steer_home");
+  flash("steerHint",r.msg||"Rejected",r.ok,STEER_ORIG);};
 
 async function steerTimed(dir){
   const s=parseFloat($("steerSecs").value);
@@ -1115,10 +1331,11 @@ def index():
 
 if __name__ == "__main__":
     print("=" * 64)
-    print("  PROJECT AEGIS — AGV OPERATOR CONSOLE  [REV 4]")
+    print("  PROJECT AEGIS — AGV OPERATOR CONSOLE  [REV 5]")
     print(f"  Mode          : {'MOCK (no hardware)' if MOCK else 'LIVE HARDWARE'}")
     print(f"  Steering      : BTS#2 GPIO{STEER_RPWM}/{STEER_LPWM} "
-          f"(active {'LOW' if STEER_ACTIVE_LOW else 'HIGH'})")
+          f"(active {'LOW' if STEER_ACTIVE_LOW else 'HIGH'}), "
+          f"limit +/-{STEER_MAX_DEG:.0f} deg, max run {STEER_MAX_RUN_S:.0f} s")
     print(f"  Gripper       : BTS#1 GPIO{GRIP_RPWM}/{GRIP_LPWM} "
           f"(active {'LOW' if GRIP_ACTIVE_LOW else 'HIGH'})")
     print(f"  Direction IN1 : GPIO{RELAY_DIR_PIN}  "
@@ -1126,7 +1343,8 @@ if __name__ == "__main__":
     print(f"  Brake     IN2 : GPIO{BRAKE_PIN}  "
           f"{'LOW' if BRAKE_ENGAGE_LEVEL == 0 else 'HIGH'} = APPLIED"
           f"{'' if BRAKE_ENABLE else '  [DISABLED]'}")
-    print(f"  AS5600 centre : raw {AS5600_CENTER_RAW}")
+    print(f"  AS5600 centre : raw {AS5600_CENTER_RAW}, "
+          f"{'CCW' if AS5600_CCW_POSITIVE else 'CW'} positive")
     print(f"  Open http://<pi-ip>:{HTTP_PORT}   (hostname -I)")
     print("=" * 64)
     app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)
